@@ -31,8 +31,8 @@ h2{font-size:18px;margin:28px 0 10px}
 .sub{color:var(--muted);margin:0 0 20px}
 
 /* progress stamps */
-.dots{display:flex;flex-wrap:wrap;gap:7px}
-.dot{width:30px;height:30px;border-radius:50%;border:2px solid var(--line);background:#fff;
+.dots{display:grid;grid-template-columns:repeat(auto-fill,minmax(26px,1fr));gap:6px}
+.dot{width:100%;max-width:34px;aspect-ratio:1;border-radius:50%;border:2px solid var(--line);background:#fff;
   font-size:12px;font-weight:700;color:var(--muted);display:grid;place-items:center;padding:0}
 .dot.ok{background:var(--ok);border-color:var(--ok);color:#fff}
 .dot.ng{background:var(--ng);border-color:var(--ng);color:#fff}
@@ -50,6 +50,11 @@ h2{font-size:18px;margin:28px 0 10px}
 .btn.danger{background:#fff;color:var(--ng);border:1px solid var(--ng-bg)}
 .btn.small{width:auto;padding:10px 16px;font-size:15px}
 .start{margin-top:22px}
+.deckhead{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:12px}
+.deckhead b{font-size:20px;letter-spacing:-.02em}
+.deckhead span{font-size:14px;color:var(--muted)}
+.deckmeta{font-size:14px;color:var(--muted);margin:12px 0 0}
+.bighan{font-family:"Noto Serif KR","Noto Serif CJK KR","Songti SC","Batang",serif;font-size:96px;line-height:1.15;text-align:center;margin:6px 0 16px}
 
 /* quiz */
 .qhead{display:flex;align-items:center;gap:8px;margin:14px 0 6px}
@@ -105,28 +110,36 @@ input[type=text],input[type=number],input[type=password],input[type=url]{width:1
 <script>
 /* ============ 상태 ============ */
 const LS_STATE='quizState.v1', LS_CFG='quizCfg.v1';
-let Q=[], QB={}, S=null, loadErr='';
+let Q=[], QB={}, DECKS=[], S=null, loadErr='';
 let cfg=JSON.parse(localStorage.getItem(LS_CFG)||'{}');
-let view='home', cur=0, syncStatus='', pushTimer=null, settingsMsg='';
+let view='home', cur=0, curDeck='', syncStatus='', pushTimer=null, settingsMsg='';
 const $app=document.getElementById('app');
 
 const e=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function todayStr(){const d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
-function defaultState(){return {v:1,updatedAt:0,perDay:10,stats:{},queue:[],today:null};}
-function loadLocal(){try{return Object.assign(defaultState(),JSON.parse(localStorage.getItem(LS_STATE)||'{}'));}catch(_){return defaultState();}}
+function defaultState(){return {v:2,updatedAt:0,perDay:10,stats:{},queue:[],days:{}};}
+function migrate(raw){
+  const s=Object.assign(defaultState(),raw||{});
+  if(!s.days)s.days={};
+  if(s.today){ if(!Object.keys(s.days).length)s.days['어휘']=s.today; delete s.today; }
+  s.v=2;return s;
+}
+function loadLocal(){try{return migrate(JSON.parse(localStorage.getItem(LS_STATE)||'{}'));}catch(_){return defaultState();}}
 function save(){S.updatedAt=Date.now();localStorage.setItem(LS_STATE,JSON.stringify(S));schedulePush();}
 function shuffle(a){a=a.slice();for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}return a;}
+const TD=()=>S.days[curDeck];
 
-/* ============ 오늘 문제 뽑기 ============ */
-function buildToday(){
+/* ============ 오늘 문제 뽑기 (분류별로 따로) ============ */
+function buildToday(deck){
   const t=todayStr(), N=Math.max(1,S.perDay|0||10);
+  const inDeck=id=>QB[id]&&QB[id].deck===deck;
   const ids=[], wrongFrom=[];
   // 1) 이전 날 틀린 문제 먼저 (오래된 순)
-  const q=S.queue.filter(x=>x.date<t&&QB[x.id]).sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:0);
+  const q=S.queue.filter(x=>x.date<t&&inDeck(x.id)).sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:0);
   for(const x of q){ if(ids.length>=N)break; if(!ids.includes(x.id)){ids.push(x.id);wrongFrom.push(x.id);} }
   // 2) 남는 자리: 푼 횟수가 적은 순 → 오래전에 푼 순 (같으면 무작위)
   if(ids.length<N){
-    const rest=shuffle(Q.map(x=>x.id).filter(id=>!ids.includes(id)));
+    const rest=shuffle(Q.filter(x=>x.deck===deck).map(x=>x.id).filter(id=>!ids.includes(id)));
     rest.sort((a,b)=>{
       const sa=S.stats[a]||{seen:0,last:''}, sb=S.stats[b]||{seen:0,last:''};
       if(sa.seen!==sb.seen)return sa.seen-sb.seen;
@@ -136,12 +149,17 @@ function buildToday(){
   }
   return {date:t,ids:shuffle(ids),wrongFrom,res:{}};
 }
-// 날짜가 바뀌었으면 새로 뽑고 true 반환
+// 날짜가 바뀐 분류는 새로 뽑고, 하나라도 새로 뽑았으면 true
 function ensureToday(){
   if(!Q.length)return false;
-  if(!S.today||S.today.date!==todayStr()){S.today=buildToday();save();return true;}
-  S.today.ids=S.today.ids.filter(id=>QB[id]);
-  return false;
+  let rebuilt=false;
+  for(const d of DECKS){
+    const t=S.days[d];
+    if(!t||t.date!==todayStr()){S.days[d]=buildToday(d);rebuilt=true;}
+    else t.ids=t.ids.filter(id=>QB[id]);
+  }
+  if(rebuilt)save();
+  return rebuilt;
 }
 
 /* ============ 동기화 (Supabase, 선택) ============ */
@@ -158,7 +176,7 @@ async function pull(){
     const rows=await r.json(); setSync('ok');
     if(!rows[0]){push();return false;}
     const d=rows[0].data;
-    if(d&&d.updatedAt>S.updatedAt){S=Object.assign(defaultState(),d);localStorage.setItem(LS_STATE,JSON.stringify(S));return true;}
+    if(d&&d.updatedAt>S.updatedAt){S=migrate(d);localStorage.setItem(LS_STATE,JSON.stringify(S));return true;}
     return false;
   }catch(_){setSync('err');return false;}
 }
@@ -172,18 +190,22 @@ async function push(){
 function schedulePush(){if(!syncOn())return;clearTimeout(pushTimer);pushTimer=setTimeout(push,700);}
 
 /* ============ 화면 ============ */
-function dotsHtml(clickable){
-  const t=S.today;
+function dotsHtml(deck,clickable){
+  const t=S.days[deck];
   return '<div class="dots">'+t.ids.map((id,i)=>{
     const r=t.res[id];
-    const cls=r&&r.tries>0?(r.everWrong?'ng':'ok'):'';
+    const cls=r&&r.tries>0?(isOk(t,id)?'ok':'ng'):'';
     const c=(clickable&&view==='quiz'&&i===cur)?' cur':'';
     return clickable
       ?`<button class="dot ${cls}${c}" onclick="go(${i})" aria-label="${i+1}번 문제">${i+1}</button>`
       :`<span class="dot ${cls}">${i+1}</span>`;
   }).join('')+'</div>';
 }
-function doneCount(){const t=S.today;return t.ids.filter(id=>t.res[id]&&t.res[id].tries>0).length;}
+function doneCount(deck){const t=S.days[deck];return t.ids.filter(id=>t.res[id]&&t.res[id].tries>0).length;}
+// 가장 최근에 푼 답이 맞았으면 '맞음' (틀렸다가 다시 풀어 맞혀도 맞은 것으로 센다)
+function isOk(t,id){const r=t.res[id];if(!r||!(r.tries>0))return false;
+  if(r.ok!==undefined)return r.ok;
+  return r.picked!=null?r.picked===QB[id].answer:!r.everWrong;}
 
 function render(){
   if(loadErr){$app.innerHTML=`<h1>문제를 불러오지 못했어요</h1><div class="err-box">${e(loadErr)}</div>`;return;}
@@ -198,27 +220,31 @@ function render(){
 }
 
 function renderHome(){
-  const t=S.today,n=t.ids.length,done=doneCount();
   const d=new Date().toLocaleDateString('ko-KR',{month:'long',day:'numeric',weekday:'long'});
-  const seen=Q.filter(q=>(S.stats[q.id]||{}).seen>0).length;
-  const pending=S.queue.filter(x=>QB[x.id]).length;
-  const label=done===0?'시작하기':done<n?'이어서 풀기':'결과 보기';
+  const panels=DECKS.map((dk,i)=>{
+    const t=S.days[dk],n=t.ids.length,done=doneCount(dk);
+    const all=Q.filter(q=>q.deck===dk);
+    const seen=all.filter(q=>(S.stats[q.id]||{}).seen>0).length;
+    const pending=S.queue.filter(x=>QB[x.id]&&QB[x.id].deck===dk).length;
+    const label=done===0?'시작하기':done<n?'이어서 풀기':'결과 보기';
+    return `<div class="panel" style="margin-top:14px">
+      <div class="deckhead"><b>${e(dk)}</b><span>오늘 ${n}문제${t.wrongFrom.length?` · 복습 ${t.wrongFrom.length}개`:''}</span></div>
+      ${dotsHtml(dk,false)}
+      <p class="deckmeta">풀어본 문제 ${seen}/${all.length} · 다시 나올 오답 ${pending}개</p>
+      <button class="btn start" style="margin-top:14px" onclick="start(${i})">${label}</button>
+    </div>`;
+  }).join('');
   $app.innerHTML=`
     <div class="top"><span class="sync" id="sync">${syncText()}</span><button class="icon-btn" onclick="openSettings()" aria-label="설정">⚙</button></div>
     <h1>${e(d)}</h1>
-    <p class="sub">오늘 ${n}문제${t.wrongFrom.length?` · 그중 지난번에 틀린 문제 ${t.wrongFrom.length}개`:''}</p>
-    <div class="panel">${dotsHtml(false)}
-      <button class="btn start" onclick="start()">${label}</button>
-    </div>
-    <div class="stats">
-      <div class="stat"><b>${done}/${n}</b><span>오늘 푼 문제</span></div>
-      <div class="stat"><b>${seen}/${Q.length}</b><span>전체 중 풀어본 문제</span></div>
-      <div class="stat"><b>${pending}</b><span>다시 나올 오답</span></div>
-    </div>`;
+    <p class="sub">${DECKS.length>1?'풀고 싶은 문제를 골라 주세요.':'오늘 풀 문제예요.'}</p>
+    ${panels}`;
 }
 
 function renderQuiz(){
-  const t=S.today,id=t.ids[cur],q=QB[id];
+  const t=TD();
+  if(!t){view='home';return render();}
+  const id=t.ids[cur],q=QB[id];
   if(!q){view='home';return render();}
   const r=t.res[id]||{},answered=r.picked!=null,ok=answered&&r.picked===q.answer;
   const isReview=t.wrongFrom.includes(id);
@@ -235,9 +261,10 @@ function renderQuiz(){
       <button class="btn ghost" onclick="retry()">다시 풀기</button>
       <button class="btn" onclick="next()">${last?'결과 보기':'다음 문제'}</button></div></div>`:'';
   $app.innerHTML=`
-    <div class="top"><button class="icon-btn" onclick="home()" aria-label="처음으로">←</button><span class="sync">${cur+1} / ${t.ids.length}</span><span style="width:44px"></span></div>
-    ${dotsHtml(true)}
+    <div class="top"><button class="icon-btn" onclick="home()" aria-label="처음으로">←</button><span class="sync">${e(curDeck)} · ${cur+1} / ${t.ids.length}</span><span style="width:44px"></span></div>
+    ${dotsHtml(curDeck,true)}
     <div class="qhead">${isReview?'<span class="tag">복습</span>':''}</div>
+    ${q.big?`<div class="bighan" lang="ko">${e(q.big)}</div>`:''}
     <div class="qtext">${e(q.question)}</div>
     ${q.image?`<img class="qimg" src="${e(q.image)}" alt="">`:''}
     <div class="choices">${ch}</div>
@@ -246,16 +273,17 @@ function renderQuiz(){
 }
 
 function renderResult(){
-  const t=S.today,n=t.ids.length;
+  const t=TD(),n=t.ids.length;
   const wrong=t.ids.filter(id=>t.res[id]&&t.res[id].everWrong);
-  const good=n-wrong.length;
+  const good=t.ids.filter(id=>isOk(t,id)).length;
+  const label=id=>{const q=QB[id];return q.big?q.big+'  '+q.choices[q.answer]:q.question.slice(0,60)+(q.question.length>60?'…':'');};
   $app.innerHTML=`
-    <div class="top"><button class="icon-btn" onclick="home()" aria-label="처음으로">←</button><span></span><span style="width:44px"></span></div>
+    <div class="top"><button class="icon-btn" onclick="home()" aria-label="처음으로">←</button><span class="sync">${e(curDeck)}</span><span style="width:44px"></span></div>
     <h1>${wrong.length===0?'전부 한 번에 맞혔어요!':'오늘 학습 끝!'}</h1>
-    <p class="sub">처음 풀었을 때 맞힌 문제</p>
+    <p class="sub">맞힌 문제</p>
     <div class="big">${good}<small> / ${n}</small></div>
-    ${dotsHtml(false)}
-    ${wrong.length?`<h2>다음에 다시 나오는 문제</h2><ul class="wrong-list">${wrong.map(id=>`<li>${e(QB[id].question.slice(0,60))}${QB[id].question.length>60?'…':''}</li>`).join('')}</ul>`:''}
+    ${dotsHtml(curDeck,false)}
+    ${wrong.length?`<h2>다음에 다시 나오는 문제</h2><ul class="wrong-list">${wrong.map(id=>`<li>${e(label(id))}${isOk(t,id)?' · 다시 풀어서 맞힘':''}</li>`).join('')}</ul>`:''}
     <div class="footer"><div class="row"><button class="btn" onclick="home()">처음으로</button></div></div>`;
   window.scrollTo(0,0);
 }
@@ -268,7 +296,7 @@ function renderSettings(){
     <h2>하루 문제 수</h2>
     <div class="panel">
       <input type="number" id="perDay" min="1" max="70" value="${S.perDay}">
-      <p class="help">바꾸면 다음 날부터 적용돼요.</p>
+      <p class="help">어휘, 한자 등 분류마다 이만큼씩 나와요. 바꾸면 다음 날부터 적용돼요.</p>
       <div style="display:flex;gap:10px;margin-top:12px">
         <button class="btn small" onclick="savePerDay()">저장</button>
         <button class="btn small ghost" onclick="rebuildToday()">오늘 문제 다시 뽑기</button>
@@ -289,8 +317,9 @@ function renderSettings(){
 
     <h2>엑셀 → 문제 파일 변환</h2>
     <div class="panel">
-      <p class="help" style="margin-top:0">첫 줄에 머리글이 있는 엑셀을 고르면 questions.json이 내려받아져요. 열 이름: ID(또는 번호), 어휘(또는 문제), 설명, 예문, 보기1~보기5, 정답(번호). 어휘만 있으면 문제는 “‘어휘’의 뜻으로 알맞은 것은?”으로 자동 만들고, 설명과 예문은 풀이로 보여줘요.</p>
-      <input type="file" id="xl" accept=".xlsx,.xls,.csv" onchange="convertXlsx(this.files[0])">
+      <p class="help" style="margin-top:0">어휘 엑셀과 한자 엑셀을 <b>한꺼번에 같이 선택</b>하면 하나의 questions.json으로 합쳐서 내려받아져요. 파일은 열 이름으로 자동 구분해요.</p>
+      <p class="help">어휘: ID, 어휘, 설명, 예문, 보기 1~4, 정답<br>한자: ID, 한자, 보기 1~4, 정답, 정답텍스트, 설명<br>그 밖: ID, 문제, 보기 1~5, 정답, 풀이, 분류(선택)</p>
+      <input type="file" id="xl" accept=".xlsx,.xls,.csv" multiple onchange="convertXlsx(this.files)">
       <div class="msg" id="convMsg">${e(settingsMsg)}</div>
     </div>
 
@@ -303,17 +332,18 @@ function renderSettings(){
 function go(i){cur=i;render();}
 function home(){view='home';render();}
 function openSettings(){view='settings';render();}
-function start(){
-  const t=S.today;
-  if(doneCount()>=t.ids.length){view='result';return render();}
+function start(i){
+  curDeck=DECKS[i];
+  const t=TD();
+  if(doneCount(curDeck)>=t.ids.length){view='result';return render();}
   cur=Math.max(0,t.ids.findIndex(id=>!(t.res[id]&&t.res[id].tries>0)));
   view='quiz';render();
 }
 function pick(i){
-  const t=S.today,id=t.ids[cur],q=QB[id];
+  const t=TD(),id=t.ids[cur],q=QB[id];
   const r=t.res[id]||(t.res[id]={tries:0,everWrong:false,picked:null});
   if(r.picked!=null)return;
-  r.picked=i;r.tries++;
+  r.picked=i;r.tries++;r.ok=(i===q.answer);
   const st=S.stats[id]||(S.stats[id]={seen:0,wrong:0,last:''});
   if(r.tries===1){st.seen++;st.last=t.date;}
   if(i!==q.answer&&!r.everWrong){r.everWrong=true;st.wrong++;}
@@ -322,20 +352,20 @@ function pick(i){
   if(r.everWrong)S.queue.push({id,date:t.date});
   save();render();
 }
-function retry(){const t=S.today,r=t.res[t.ids[cur]];if(r){r.picked=null;save();render();}}
+function retry(){const t=TD(),r=t.res[t.ids[cur]];if(r){r.picked=null;save();render();}}
 function next(){
-  if(cur<S.today.ids.length-1){cur++;render();}
+  if(cur<TD().ids.length-1){cur++;render();}
   else{view='result';render();}
 }
 function savePerDay(){
   const v=Math.min(70,Math.max(1,parseInt(document.getElementById('perDay').value,10)||10));
-  S.perDay=v;save();alert('저장했어요. 다음 날부터 하루 '+v+'문제가 나와요.');
+  S.perDay=v;save();alert('저장했어요. 다음 날부터 분류마다 '+v+'문제씩 나와요.');
 }
 function rebuildToday(){
-  if(!confirm('오늘 푼 기록이 사라지고 문제를 새로 뽑아요. 계속할까요?'))return;
-  // 오늘 푼 문제의 오답 대기열 기록도 되돌림: 오늘 날짜로 들어간 항목 제거
+  if(!confirm('오늘 푼 기록이 사라지고 모든 분류의 문제를 새로 뽑아요. 계속할까요?'))return;
   S.queue=S.queue.filter(x=>x.date!==todayStr());
-  S.today=buildToday();save();view='home';render();
+  DECKS.forEach(d=>{S.days[d]=buildToday(d);});
+  save();view='home';render();
 }
 async function saveSync(){
   cfg={url:document.getElementById('cUrl').value.trim(),key:document.getElementById('cKey').value.trim(),code:document.getElementById('cCode').value.trim()};
@@ -353,50 +383,90 @@ function resetAll(){
 }
 
 /* ============ 엑셀 변환 ============ */
+/*CONVERT_START*/
+const TEXT_FIXES=[['보 거나','보거나'],['만 큼','만큼'],['나아 지는','나아지는'],['내 는 것','내는 것'],['통융성','융통성'],['사업 이 잘되다','사업이 잘되다'],['재주..','재주.']];
+function convertRows(rows,fileName){
+  const list=[],notes=[],fixed={};
+  const clean=s=>{
+    s=String(s).trim();
+    for(const [a,b] of TEXT_FIXES){ if(s.includes(a)){fixed[a]=(fixed[a]||0)+s.split(a).length-1;s=s.split(a).join(b);} }
+    if(s.endsWith(',')){fixed['끝 쉼표']=(fixed['끝 쉼표']||0)+1;s=s.slice(0,-1)+'.';}
+    return s;
+  };
+  rows.forEach((row,i)=>{
+    const rowNo=i+2, where='['+fileName+'] '+rowNo+'행: ';
+    const m={};for(const k in row)m[String(k).replace(/\s+/g,'').toLowerCase()]=row[k];
+    const get=(...names)=>{for(const n of names){if(m[n]!==undefined&&String(m[n]).trim()!=='')return m[n];}return '';};
+    const vocab=String(get('어휘','낱말','단어','vocab','word')).trim();
+    const hanja=String(get('한자','hanja')).trim();
+    let question=String(get('문제','question','질문')).trim();
+    let deck=String(get('분류','과목','deck')).trim(), big='', kind='generic';
+    if(!question&&vocab){question='‘'+vocab+'’의 뜻으로 알맞은 것은?';deck=deck||'어휘';kind='vocab';}
+    else if(!question&&hanja){question='다음 한자의 뜻(훈)과 소리(음)로 알맞은 것은?';big=hanja;deck=deck||'한자';kind='hanja';}
+    if(!question)return;
+    deck=deck||fileName.replace(/\.[^.]+$/,'')||'문제';
+    const choices=[];
+    for(let n=1;n<=5;n++){
+      const v=get('보기'+n,'선택지'+n,'선택'+n,'choice'+n,n+'번',String(n),'①②③④⑤'[n-1]);
+      if(v!=='')choices.push(clean(v));
+    }
+    const a=String(get('정답','answer','답')).trim();
+    let idx=-1;const dm=a.match(/^\d+/);
+    if(dm)idx=parseInt(dm[0],10)-1;
+    else if('①②③④⑤'.includes(a[0]||'x'))idx='①②③④⑤'.indexOf(a[0]);
+    else if(/^[A-Ea-e]$/.test(a))idx='abcde'.indexOf(a.toLowerCase());
+    if(choices.length<2){notes.push(where+'보기가 2개 미만이라 뺐어요');return;}
+    if(idx<0||idx>=choices.length){notes.push(where+'정답을 읽을 수 없어 뺐어요("'+a+'")');return;}
+    if(new Set(choices).size!==choices.length)notes.push(where+'똑같은 보기가 있어요. 확인해 주세요');
+    let expl='';
+    if(kind==='vocab'){
+      const desc=clean(get('설명','뜻','desc')), ex=clean(get('예문','example'));
+      if(desc&&choices[idx]!==desc)notes.push(where+'정답 보기와 설명이 달라요. 확인해 주세요');
+      expl=vocab+': '+(desc||choices[idx])+(ex?'\n\n예문: '+ex:'');
+    }else if(kind==='hanja'){
+      const at=clean(get('정답텍스트','answertext')), why=clean(get('설명','풀이','해설','explanation'));
+      if(at&&choices[idx]!==at)notes.push(where+'정답텍스트와 정답 번호의 보기가 달라요. 확인해 주세요');
+      expl=hanja+' → '+(at||choices[idx])+(why?'\n\n'+why:'');
+    }else{
+      expl=clean(get('풀이','해설','설명','explanation'));
+    }
+    let id=get('번호','id','no');
+    id=id!==''&&!isNaN(id)?Number(id):(id||rowNo-1);
+    if(deck!=='어휘')id=deck+'-'+id;
+    const o={id,deck,question};
+    if(big)o.big=big;
+    o.choices=choices;o.answer=idx;o.explanation=expl;
+    const img=String(get('이미지','image')).trim();if(img)o.image=img;
+    list.push(o);
+  });
+  return {list,notes,fixed};
+}
+/*CONVERT_END*/
 function loadScript(src){return new Promise((res,rej)=>{const s=document.createElement('script');s.src=src;s.onload=res;s.onerror=()=>rej(new Error('변환 도구를 불러오지 못했어요. 인터넷 연결을 확인하세요.'));document.head.appendChild(s);});}
-async function convertXlsx(file){
+async function convertXlsx(files){
   const out=document.getElementById('convMsg');
-  if(!file)return;
+  if(!files||!files.length)return;
   try{
     out.textContent='변환 중…';
     if(!window.XLSX)await loadScript('https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js');
-    const wb=XLSX.read(await file.arrayBuffer(),{type:'array'});
-    const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:''});
-    const list=[],errs=[];
-    rows.forEach((row,i)=>{
-      const m={};for(const k in row)m[k.replace(/\s+/g,'').toLowerCase()]=row[k];
-      const get=(...names)=>{for(const n of names){if(m[n]!==undefined&&String(m[n]).trim()!=='')return m[n];}return '';};
-      const vocab=String(get('어휘','낱말','단어','vocab','word')).trim();
-      let question=String(get('문제','question','질문')).trim();
-      if(!question&&vocab)question='‘'+vocab+'’의 뜻으로 알맞은 것은?';
-      if(!question)return;
-      const choices=[];
-      for(let n=1;n<=5;n++){
-        const v=get('보기'+n,'선택지'+n,'선택'+n,'choice'+n,n+'번',String(n),'①②③④⑤'[n-1]);
-        if(v!=='')choices.push(String(v).trim());
-      }
-      const a=String(get('정답','answer','답')).trim();
-      let idx=-1;const dm=a.match(/^\d+/);
-      if(dm)idx=parseInt(dm[0],10)-1;
-      else if('①②③④⑤'.includes(a[0]||'x'))idx='①②③④⑤'.indexOf(a[0]);
-      else if(/^[A-Ea-e]$/.test(a))idx='abcde'.indexOf(a.toLowerCase());
-      if(choices.length<2){errs.push((i+2)+'행: 보기가 2개 미만');return;}
-      if(idx<0||idx>=choices.length){errs.push((i+2)+'행: 정답을 읽을 수 없음("'+a+'")');return;}
-      let id=get('번호','id','no');id=id!==''&&!isNaN(id)?Number(id):(id||i+1);
-      let expl=String(get('풀이','해설','explanation')).trim();
-      if(!expl&&vocab){
-        const desc=String(get('설명','뜻','desc')).trim(), ex=String(get('예문','example')).trim();
-        expl=vocab+': '+desc+(ex?'\n\n예문: '+ex:'');
-      }
-      const o={id,question,choices,answer:idx,explanation:expl};
-      const img=String(get('이미지','image')).trim();if(img)o.image=img;
-      list.push(o);
-    });
-    const ids=new Set(list.map(x=>x.id));
-    if(ids.size!==list.length)errs.push('번호가 중복돼요. 번호 열은 문제마다 달라야 합니다.');
-    const blob=new Blob([JSON.stringify(list,null,2)],{type:'application/json'});
+    let all=[],notes=[];const fixed={};
+    for(const f of Array.from(files)){
+      const wb=XLSX.read(await f.arrayBuffer(),{type:'array'});
+      const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:''});
+      const r=convertRows(rows,f.name);
+      all=all.concat(r.list);notes=notes.concat(r.notes);
+      for(const k in r.fixed)fixed[k]=(fixed[k]||0)+r.fixed[k];
+    }
+    const seen=new Set(),dups=[];
+    all.forEach(x=>{if(seen.has(x.id))dups.push(x.id);seen.add(x.id);});
+    if(dups.length)notes.push('ID가 겹쳐요: '+dups.slice(0,10).join(', ')+' (분류마다 ID는 1, 2, 3…처럼 서로 달라야 해요)');
+    const counts={};all.forEach(x=>{counts[x.deck]=(counts[x.deck]||0)+1;});
+    const blob=new Blob([JSON.stringify(all,null,2)],{type:'application/json'});
     const a2=document.createElement('a');a2.href=URL.createObjectURL(blob);a2.download='questions.json';a2.click();
-    out.textContent=list.length+'문제를 변환해 questions.json으로 내려받았어요.'+(errs.length?'\n확인이 필요한 항목:\n'+errs.join('\n'):'')+'\n이 파일을 index.html과 같은 폴더에 넣고 다시 올려주세요.';
+    const fx=Object.keys(fixed).length?'\n자동으로 고친 글자: '+Object.entries(fixed).map(([k,v])=>k+' '+v+'곳').join(', '):'';
+    out.textContent=Object.entries(counts).map(([k,v])=>k+' '+v+'문제').join(', ')+'를 합쳐 questions.json으로 내려받았어요.'+fx
+      +(notes.length?'\n\n확인이 필요한 항목:\n'+notes.join('\n'):'')
+      +'\n\n이 파일을 index.html과 같은 폴더에 넣고 다시 올려주세요.';
   }catch(err){out.textContent='변환 실패: '+err.message;}
 }
 
@@ -413,7 +483,8 @@ async function init(){
       :err.message;
     return render();
   }
-  Q.forEach(q=>QB[q.id]=q);
+  Q.forEach(q=>{q.deck=q.deck||'어휘';QB[q.id]=q;});
+  DECKS=[...new Set(Q.map(q=>q.deck))];
   await pull();
   ensureToday();render();
 }
@@ -421,7 +492,11 @@ document.addEventListener('visibilitychange',async()=>{
   if(document.hidden||!S||!Q.length||view==='settings')return;
   const changed=await pull();
   const rebuilt=ensureToday();
-  if(rebuilt||changed){if(rebuilt||cur>=S.today.ids.length)view='home';render();}
+  if(rebuilt||changed){
+    const t=TD();
+    if(rebuilt||!t||cur>=t.ids.length)view='home';
+    render();
+  }
 });
 init();
 </script>
